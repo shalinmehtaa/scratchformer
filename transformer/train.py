@@ -67,6 +67,8 @@ def parse_args() -> argparse.Namespace:
     # System
     p.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     p.add_argument("--seed", type=int, default=1709)
+    p.add_argument("--precision", type=str, default="bf16", choices=["fp32", "fp16", "bf16"],
+                   help="Training precision: bf16 (default, requires Ampere+), fp16 (with GradScaler), fp32")
 
     # Performance
     p.add_argument("--compile", action="store_true", help="Enable torch.compile for the model")
@@ -100,19 +102,20 @@ def evaluate(model: Transformer,
              batch_size: int,
              context_length: int,
              device: str,
-             num_batches: int) -> float:
+             num_batches: int,
+             autocast_dtype: torch.dtype = torch.bfloat16) -> float:
     # All ranks must participate in forward under FSDP
     was_training = model.training
     model.eval()
 
     device_type = "cuda" if "cuda" in device else "cpu"
+    use_autocast = autocast_dtype != torch.float32 and device_type == "cuda"
     total = torch.tensor(0.0, device=device_type)
     count = torch.tensor(0, device=device_type)
 
     for _ in range(num_batches):
         xb, yb = get_batch(x_valid, batch_size, context_length, device)
-        # Match training numerics: forward under autocast
-        with torch.autocast(device_type=device_type, dtype=torch.bfloat16 if device_type == "cuda" else torch.float32):
+        with torch.autocast(device_type=device_type, dtype=autocast_dtype, enabled=use_autocast):
             logits = model(xb)
             loss = cross_entropy(logits, yb)
             total += loss.detach()
@@ -230,6 +233,11 @@ def main():
         if is_main_process():
             print(f"Resumed from {args.resume} at step={start_step}")
 
+    # Precision setup
+    autocast_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[args.precision]
+    use_autocast = args.precision != "fp32" and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=(args.precision == "fp16" and device.type == "cuda"))
+
     # Training loop
     model.train()
     tokens_per_micro_step = args.batch_size * args.context_length
@@ -253,19 +261,21 @@ def main():
         total_loss = 0.0
         for _ in range(args.grad_accum_steps):
             xb, yb = get_batch(x_train, args.batch_size, args.context_length, device=str(device))
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32):
+            with torch.autocast(device_type=device.type, dtype=autocast_dtype, enabled=use_autocast):
                 logits = model(xb)
                 loss = cross_entropy(logits, yb) / args.grad_accum_steps
                 total_loss += loss.item()
-                loss.backward()
+            scaler.scale(loss).backward()
 
-        # Gradient clipping
+        # Gradient clipping (unscale first for fp16 to get true grad norms)
+        scaler.unscale_(optimizer)
         if args.fsdp:
             grad_norm = FSDP.clip_grad_norm_(model, args.clip_grad)
         else:
             grad_norm = gradient_clipping(list(model.parameters()), args.clip_grad)
 
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         # Logging (rank 0)
         do_log = ((step + 1) % args.log_interval == 0) or (step == start_step)
@@ -275,7 +285,7 @@ def main():
             tps = toks / max(1e-6, elapsed)
 
             # Everyone runs eval (needed for FSDP), only rank 0 prints/writes
-            val_loss = evaluate(model, x_valid, args.batch_size, args.context_length, device=str(device), num_batches=args.eval_batches)
+            val_loss = evaluate(model, x_valid, args.batch_size, args.context_length, device=str(device), num_batches=args.eval_batches, autocast_dtype=autocast_dtype)
 
             if main_process:
                 loss_item = total_loss
