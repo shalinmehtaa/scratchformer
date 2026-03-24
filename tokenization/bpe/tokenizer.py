@@ -1,12 +1,13 @@
 import json
+import heapq
 import base64
 import argparse
 from pathlib import Path
 from typing import (
-    Dict, 
-    List, 
-    Tuple, 
-    Optional, 
+    Dict,
+    List,
+    Tuple,
+    Optional,
     Self,
     Iterable,
     Iterator
@@ -88,42 +89,76 @@ class Tokenizer:
         if st_id is not None:
             yield st_id
             return
-        
-        tokens: List[bytes] = [bytes([b]) for b in pretoken]
 
-        # Greedy BPE: repeatedly merge the lowest-rank adjacent pair
-        if len(tokens) >= 2:
-            while True:
-                best_pair: Optional[Tuple[bytes, bytes]] = None
-                best_rank: Optional[int] = None
-                # Find best-ranked adjacent pair present
-                for i in range(len(tokens) - 1):
-                    pair = (tokens[i], tokens[i + 1])
-                    rank = self._merge_ranks.get(pair)
-                    if rank is not None and (best_rank is None or rank < best_rank):
-                        best_rank = rank
-                        best_pair = pair
-                if best_pair is None:
-                    break
+        n = len(pretoken)
+        if n == 0:
+            return
+        if n == 1:
+            yield self._token_to_id[pretoken]
+            return
 
-                # Merge all occurrences of best_pair, left-to-right
-                i = 0
-                out: List[bytes] = []
-                while i < len(tokens):
-                    if (
-                        i + 1 < len(tokens)
-                        and tokens[i] == best_pair[0]
-                        and tokens[i + 1] == best_pair[1]
-                    ):
-                        out.append(tokens[i] + tokens[i + 1])
-                        i += 2
-                    else:
-                        out.append(tokens[i])
-                        i += 1
-                tokens = out
+        # Doubly-linked list: each node is [token_bytes, prev_idx, next_idx]
+        # Using parallel arrays for speed
+        tok = [bytes([b]) for b in pretoken]
+        prev_node = [i - 1 for i in range(n)]
+        next_node = [i + 1 for i in range(n)]
+        alive = [True] * n
 
-        for tok in tokens:
-            yield self._token_to_id[tok]
+        # Min-heap of (merge_rank, left_idx) — lower rank = higher priority
+        heap: List[Tuple[int, int]] = []
+        merge_ranks = self._merge_ranks
+
+        for i in range(n - 1):
+            pair = (tok[i], tok[i + 1])
+            rank = merge_ranks.get(pair)
+            if rank is not None:
+                heapq.heappush(heap, (rank, i))
+
+        while heap:
+            rank, left = heapq.heappop(heap)
+            # Lazy deletion: skip if left was consumed or its right neighbor changed
+            if not alive[left]:
+                continue
+            right = next_node[left]
+            if right >= n or not alive[right]:
+                continue
+            # Verify the pair still matches the rank we recorded
+            pair = (tok[left], tok[right])
+            actual_rank = merge_ranks.get(pair)
+            if actual_rank is None or actual_rank != rank:
+                continue
+
+            # Merge: combine left and right into left node
+            tok[left] = tok[left] + tok[right]
+            alive[right] = False
+
+            # Update linked list: skip right
+            nxt = next_node[right]
+            next_node[left] = nxt
+            if nxt < n:
+                prev_node[nxt] = left
+
+            # Check new pair with left's predecessor
+            prv = prev_node[left]
+            if prv >= 0 and alive[prv]:
+                new_pair = (tok[prv], tok[left])
+                r = merge_ranks.get(new_pair)
+                if r is not None:
+                    heapq.heappush(heap, (r, prv))
+
+            # Check new pair with left's new successor
+            if nxt < n and alive[nxt]:
+                new_pair = (tok[left], tok[nxt])
+                r = merge_ranks.get(new_pair)
+                if r is not None:
+                    heapq.heappush(heap, (r, left))
+
+        # Emit tokens by walking the linked list
+        i = 0
+        while i < n:
+            if alive[i]:
+                yield self._token_to_id[tok[i]]
+            i = next_node[i] if alive[i] else i + 1
 
     def encode(self, text: str) -> List[int]:
         pretokens: List[bytes] = pretokenize_chunk(chunk=text, 
