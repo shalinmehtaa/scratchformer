@@ -72,6 +72,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--compile", action="store_true", help="Enable torch.compile for the model")
     p.add_argument("--compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"])
     p.add_argument("--fsdp", action="store_true", help="Enable FSDP")
+    p.add_argument("--no_sdpa", action="store_true", help="Disable PyTorch SDPA (flash/efficient attention). SDPA is on by default.")
     p.add_argument("--grad_accum_steps", type=int, default=1)
     p.add_argument("--weights_only", action="store_true", help="Save model weights only (no optimizer).")
     p.add_argument("--sharded_checkpoint", action="store_true", help="Save/load sharded checkpoints per-rank.")
@@ -165,7 +166,8 @@ def main():
 
     device = torch.device(args.device)        
 
-    # Build model
+    # Build model (SDPA enabled by default for flash/efficient attention)
+    use_sdpa = not args.no_sdpa
     model = Transformer(
         vocab_size=args.vocab_size,
         context_length=args.context_length,
@@ -176,12 +178,26 @@ def main():
         theta=args.theta,
         device=device,
         dtype=None,
-        use_sdpa=args.fsdp,
-    ) 
+        use_sdpa=use_sdpa,
+    )
 
     if args.compile:
-        # torch.compile + FSDP is fragile; skip compile when using fsdp
         assert not args.fsdp, "Disable --compile when using --fsdp"
+
+    # Helper: build fused AdamW when on CUDA, fall back to custom AdamW on CPU
+    def _make_optimizer(params):
+        if device.type == "cuda":
+            try:
+                return torch.optim.AdamW(
+                    params, lr=args.lr, betas=tuple(args.betas),
+                    weight_decay=args.weight_decay, fused=True,
+                )
+            except TypeError:
+                return torch.optim.AdamW(
+                    params, lr=args.lr, betas=tuple(args.betas),
+                    weight_decay=args.weight_decay,
+                )
+        return AdamW(params, lr=args.lr, betas=tuple(args.betas), weight_decay=args.weight_decay)
 
     if args.fsdp:
         auto_wrap = functools.partial(
@@ -198,31 +214,12 @@ def main():
             mixed_precision=mp,
             device_id=device,
         )
-        # Optimizer: native fused AdamW under FSDP; custom otherwise
-        use_fused = (device.type == "cuda")
-        try:
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=args.lr,
-                betas=tuple(args.betas),
-                weight_decay=args.weight_decay,
-                fused=use_fused,
-            )
-        except TypeError:
-            optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=args.lr,
-                betas=tuple(args.betas),
-                weight_decay=args.weight_decay,
-            ) 
+        optimizer = _make_optimizer(model.parameters())
     else:
         model.to(device)
-        optimizer = AdamW(
-            model.parameters(),
-            lr=args.lr,
-            betas=tuple(args.betas),
-            weight_decay=args.weight_decay
-        )
+        if args.compile:
+            model = torch.compile(model, mode=args.compile_mode)
+        optimizer = _make_optimizer(model.parameters())
 
     start_step = 0
     if args.resume is not None and os.path.exists(args.resume):
