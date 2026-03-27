@@ -4,7 +4,6 @@ import torch.nn.functional as F
 from torch import Tensor
 from typing import Optional, Union
 from jaxtyping import Float, Int, Bool
-from torch.nn.attention import SDPBackend, sdpa_kernel
 
 def softmax(x: torch.Tensor, dim: int, temperature: Optional[float] = None) -> torch.Tensor:
     """Implement numerically stable softmax from scratch"""
@@ -182,12 +181,13 @@ class RotaryPositionalEmbedding(nn.Module):
 
 class MultiHeadSelfAttention(nn.Module):
     """Implement causal multi-head attention from scratch"""
-    def __init__(self, 
-                 d_model: int, 
-                 num_heads: int, 
+    def __init__(self,
+                 d_model: int,
+                 num_heads: int,
+                 max_seq_len: int = 2048,
                  use_sdpa: bool = False,
                  rope: Optional["RotaryPositionalEmbedding"] = None,
-                 device: Optional[Union[str, torch.device]] = None, 
+                 device: Optional[Union[str, torch.device]] = None,
                  dtype: Optional[torch.dtype] = None):
         super().__init__()
         assert d_model % num_heads == 0, "d_model must be a multiple of num_heads"
@@ -205,6 +205,11 @@ class MultiHeadSelfAttention(nn.Module):
             assert self.rope.head_dim == self.head_dim, "RoPE d_k must equal head_dim"
 
         self.use_sdpa = use_sdpa
+
+        # Pre-compute causal mask once (used only when use_sdpa=False)
+        if not use_sdpa:
+            causal_mask = torch.ones(max_seq_len, max_seq_len, dtype=torch.bool, device=device).tril()
+            self.register_buffer("causal_mask", causal_mask, persistent=False)
 
     def forward(self, 
                 x: Float[Tensor, "batch seq_len d_model"], 
@@ -227,14 +232,11 @@ class MultiHeadSelfAttention(nn.Module):
             k = self.rope(k, pos_b1s)
 
         if self.use_sdpa:
-            # Prefer native SDPA kernels on CUDA when using FSDP
-            with sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.FLASH_ATTENTION]):
-                attn_out = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True
-                ) # [b, h, s, d]
+            attn_out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True
+            ) # [b, h, s, d]
         else:
-            mask = torch.ones(s, s, dtype=torch.bool, device=x.device).tril()
-            attn_out = scaled_dot_product_attention(q, k, v, mask) # [b, h, s, d]
+            attn_out = scaled_dot_product_attention(q, k, v, self.causal_mask[:s, :s]) # [b, h, s, d]
 
         out = attn_out.transpose(1, 2).reshape(b, s, self.d_model)
         return self.o_proj(out)
@@ -256,7 +258,7 @@ class TransformerBlock(nn.Module):
         self.ln1 = RMSNorm(d_model=d_model)
         self.ln2 = RMSNorm(d_model=d_model)
         self.rope = RotaryPositionalEmbedding(theta=theta, head_dim=self.head_dim, max_seq_len=max_seq_len, device=device, dtype=dtype)
-        self.attn = MultiHeadSelfAttention(d_model=d_model, num_heads=num_heads, rope=self.rope, device=device, dtype=dtype, use_sdpa=use_sdpa)
+        self.attn = MultiHeadSelfAttention(d_model=d_model, num_heads=num_heads, max_seq_len=max_seq_len, rope=self.rope, device=device, dtype=dtype, use_sdpa=use_sdpa)
         self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff, device=device, dtype=dtype)
 
     def forward(self, x):

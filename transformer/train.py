@@ -72,6 +72,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--compile", action="store_true", help="Enable torch.compile for the model")
     p.add_argument("--compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"])
     p.add_argument("--fsdp", action="store_true", help="Enable FSDP")
+    p.add_argument("--no-sdpa", action="store_true", help="Disable PyTorch SDPA (use custom attention)")
     p.add_argument("--grad_accum_steps", type=int, default=1)
     p.add_argument("--weights_only", action="store_true", help="Save model weights only (no optimizer).")
     p.add_argument("--sharded_checkpoint", action="store_true", help="Save/load sharded checkpoints per-rank.")
@@ -176,7 +177,7 @@ def main():
         theta=args.theta,
         device=device,
         dtype=None,
-        use_sdpa=args.fsdp,
+        use_sdpa=not getattr(args, 'no_sdpa', False),
     ) 
 
     if args.compile:
