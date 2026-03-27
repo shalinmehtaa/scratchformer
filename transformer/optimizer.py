@@ -83,27 +83,28 @@ class AdamW(torch.optim.Optimizer):
                 if p.grad is None:
                     continue
                 # Get state associated with p
-                state = self.state[p] 
-                # Get current state values
-                t = state.get("t", 1)
-                m = state.get("m", 0)
-                v = state.get("v", 0)
+                state = self.state[p]
+                # Initialize state tensors on first step (avoids scalar→tensor overhead)
+                if "t" not in state:
+                    state["t"] = 1
+                    state["m"] = torch.zeros_like(p.data)
+                    state["v"] = torch.zeros_like(p.data)
+                t = state["t"]
+                m = state["m"]
+                v = state["v"]
 
                 # Get the gradient for p
-                grad = p.grad.data 
-                # Compute moments and lr
-                m_t = beta_1 * m + (1 - beta_1) * grad
-                v_t = beta_2 * v + (1 - beta_2) * grad**2
+                grad = p.grad.data
+                # Compute moments and lr (in-place where possible)
+                m.mul_(beta_1).add_(grad, alpha=1 - beta_1)
+                v.mul_(beta_2).addcmul_(grad, grad, value=1 - beta_2)
                 lr_t = lr * (math.sqrt(1 - beta_2**t) / (1 - beta_1**t))
-                
+
                 # Update parameter in place with weight decay
-                p.data -= lr_t * (m_t / (torch.sqrt(v_t) + self.eps)) 
-                p.data -= lr * weight_decay * p.data
-                
-                # Update state dict
-                state["t"] = t + 1 
-                state["m"] = m_t
-                state["v"] = v_t
+                p.data.add_(m / (v.sqrt() + self.eps), alpha=-lr_t)
+                p.data.mul_(1 - lr * weight_decay)
+
+                state["t"] = t + 1
                 
         return loss
     

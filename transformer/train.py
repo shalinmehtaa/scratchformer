@@ -72,6 +72,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--compile", action="store_true", help="Enable torch.compile for the model")
     p.add_argument("--compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"])
     p.add_argument("--fsdp", action="store_true", help="Enable FSDP")
+    p.add_argument("--no_sdpa", action="store_true", help="Disable SDPA (FlashAttention) kernels")
     p.add_argument("--grad_accum_steps", type=int, default=1)
     p.add_argument("--weights_only", action="store_true", help="Save model weights only (no optimizer).")
     p.add_argument("--sharded_checkpoint", action="store_true", help="Save/load sharded checkpoints per-rank.")
@@ -165,7 +166,8 @@ def main():
 
     device = torch.device(args.device)        
 
-    # Build model
+    # Build model (SDPA/FlashAttention enabled by default)
+    use_sdpa = not args.no_sdpa
     model = Transformer(
         vocab_size=args.vocab_size,
         context_length=args.context_length,
@@ -176,8 +178,8 @@ def main():
         theta=args.theta,
         device=device,
         dtype=None,
-        use_sdpa=args.fsdp,
-    ) 
+        use_sdpa=use_sdpa,
+    )
 
     if args.compile:
         # torch.compile + FSDP is fragile; skip compile when using fsdp
@@ -253,14 +255,15 @@ def main():
             g["lr"] = lr
 
         optimizer.zero_grad(set_to_none=True)
-        total_loss = 0.0
+        accum_loss = torch.tensor(0.0, device=device)
         for _ in range(args.grad_accum_steps):
             xb, yb = get_batch(x_train, args.batch_size, args.context_length, device=str(device))
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32):
                 logits = model(xb)
                 loss = cross_entropy(logits, yb) / args.grad_accum_steps
-                total_loss += loss.item()
+                accum_loss += loss.detach()
                 loss.backward()
+        total_loss = accum_loss.item()  # single sync point
 
         # Gradient clipping
         if args.fsdp:

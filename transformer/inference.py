@@ -78,32 +78,45 @@ def generate(
     finished = torch.zeros(num_samples, dtype=torch.bool, device=device)
 
     with torch.inference_mode():
-        for _ in range(max_new_tokens):
-            # Window the context to the model's max
-            input_tokens = tokens_full[:, -context_len:]
+        # Prefill: process the entire prompt, populate KV-cache
+        input_tokens = tokens_full[:, -context_len:]
+        logits, kv_caches = model(input_tokens, kv_caches=[None] * model.num_layers)
+        next_logits = logits[:, -1, :]  # [B, V]
 
-            logits = model(input_tokens)  # [B, S, V]
-            next_logits = logits[:, -1, :]  # [B, V]
+        filtered_logits = _top_k_top_p_filtering(next_logits, top_k=top_k, top_p=top_p)
+        probs = softmax(filtered_logits, dim=-1, temperature=temperature)
+        next_token = torch.multinomial(probs, num_samples=1)  # [B, 1]
 
-            # Apply top-k/top-p on raw logits, then temperature in softmax
+        if eos_id is not None:
+            finished |= (next_token.squeeze(1) == eos_id)
+        tokens_full = torch.cat([tokens_full, next_token], dim=1)
+
+        # Decode: one token at a time using KV-cache (O(1) per token instead of O(n))
+        for _ in range(max_new_tokens - 1):
+            if finished.all():
+                break
+
+            # Only feed the last token; KV-cache has all prior context
+            logits, kv_caches = model(next_token, kv_caches=kv_caches)
+            next_logits = logits[:, -1, :]
+
             filtered_logits = _top_k_top_p_filtering(next_logits, top_k=top_k, top_p=top_p)
-            probs = softmax(filtered_logits, dim=-1, temperature=temperature)  # [B, V]
-            next_token = torch.multinomial(probs, num_samples=1)  # [B, 1]
+            probs = softmax(filtered_logits, dim=-1, temperature=temperature)
+            next_token = torch.multinomial(probs, num_samples=1)
 
             if eos_id is not None:
                 finished |= (next_token.squeeze(1) == eos_id)
-
             tokens_full = torch.cat([tokens_full, next_token], dim=1)
 
-            if finished.all():
-                break
+            # Evict oldest entries if cache exceeds context length
+            if kv_caches[0][0].shape[2] >= context_len:
+                kv_caches = [(k[:, :, 1:, :], v[:, :, 1:, :]) for k, v in kv_caches]
 
     # Decode per sample (trim at first EOS if present)
     outputs: List[str] = []
     for b in range(num_samples):
         ids = tokens_full[b].tolist()
         if eos_id is not None and eos_id in ids[len(prompt_ids):]:
-            # Only trim in the generated suffix
             suffix = ids[len(prompt_ids):]
             cut = suffix.index(eos_id)
             ids = ids[: len(prompt_ids) + cut]

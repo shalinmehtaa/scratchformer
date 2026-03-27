@@ -8,9 +8,9 @@ from numpy.typing import NDArray
 
 
 def get_batch(x: NDArray,
-              batch_size: int, 
-              context_length: int, 
-              device: str) -> Tuple[Int[Tensor, "batch_size seq_len"], 
+              batch_size: int,
+              context_length: int,
+              device: str) -> Tuple[Int[Tensor, "batch_size seq_len"],
                                     Int[Tensor, "batch_size seq_len"]]:
     """Sample a batch of contiguous token sequences from a 1D numpy array (or np.memmap)."""
     if x.ndim != 1:
@@ -35,10 +35,14 @@ def get_batch(x: NDArray,
     inputs_np  = x[idx_in]
     targets_np = x[idx_tg]
 
-    # Convert to torch.long on the provided device
-    inputs  = torch.as_tensor(inputs_np, dtype=torch.long, device=device)
-    targets = torch.as_tensor(targets_np, dtype=torch.long, device=device)
-    
+    # Pin memory for async CPU→GPU transfer when targeting CUDA
+    if "cuda" in device:
+        inputs  = torch.from_numpy(inputs_np.astype(np.int64)).pin_memory().to(device, non_blocking=True)
+        targets = torch.from_numpy(targets_np.astype(np.int64)).pin_memory().to(device, non_blocking=True)
+    else:
+        inputs  = torch.as_tensor(inputs_np, dtype=torch.long, device=device)
+        targets = torch.as_tensor(targets_np, dtype=torch.long, device=device)
+
     return inputs, targets
 
 

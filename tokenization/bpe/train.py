@@ -1,5 +1,6 @@
 import time
 import json
+import heapq
 import base64
 import pstats
 import cProfile
@@ -64,27 +65,30 @@ class Trainer:
         
         return dict(pair_counts), pair_index
             
-    def _get_pair_with_max_count(self, 
-                                pair_counts: Dict[Tuple[int, int], int],
-                                vocab: Dict[int, bytes]) -> Tuple[int, int]:
-        """Get the pair with max counts; break ties with lexicographically greater pair"""
-        max_count = max(pair_counts.values())
-        max_count_pairs = [
-            pair for pair, count in pair_counts.items() if count == max_count
-        ]
+    def _build_heap(self, pair_counts: Dict[Tuple[int, int], int],
+                    vocab: Dict[int, bytes]) -> list:
+        """Build a max-heap of (-count, tiebreaker, pair) tuples."""
+        heap = []
+        for pair, count in pair_counts.items():
+            tb = (vocab[pair[0]], vocab[pair[1]])
+            heapq.heappush(heap, (-count, tb, pair))
+        return heap
 
-        # Return the only pair with max count if no ties
-        if len(max_count_pairs) == 1:
-            return max_count_pairs[0]
-        
-        # If there are ties, choose the lexicographically greater pair based on byte representation
-        def pair_to_bytes(pair):
-            return (vocab[pair[0]], vocab[pair[1]])
-    
-        # Find the pair with lexicographically maximum byte representation
-        max_count_pair = max(max_count_pairs, key=pair_to_bytes)
-        
-        return max_count_pair
+    def _heap_pop_valid(self, heap: list,
+                        pair_counts: Dict[Tuple[int, int], int],
+                        vocab: Dict[int, bytes]) -> Optional[Tuple[int, int]]:
+        """Pop the highest-count pair whose count is still current (lazy deletion)."""
+        while heap:
+            neg_count, _tb, pair = heapq.heappop(heap)
+            current = pair_counts.get(pair, 0)
+            if current == 0:
+                continue
+            if current == -neg_count:
+                return pair
+            # Count changed since push — re-insert with correct count
+            tb = (vocab.get(pair[0], b""), vocab.get(pair[1], b""))
+            heapq.heappush(heap, (-current, tb, pair))
+        return None
 
     def _merge_all_occurrences(self, 
                                pretoken: List[int],
@@ -149,7 +153,7 @@ class Trainer:
 
         return pair_counts, pair_index
     
-    def train(self, 
+    def train(self,
               pretokens: List[bytes]) -> Tuple[Dict[int, bytes], List[bytes]]:
         """Run the training algorithm"""
         # Initialize vocabulary
@@ -159,7 +163,7 @@ class Trainer:
         next_token_id = len(vocab)
         for special_token in self.special_tokens:
             vocab[next_token_id] = special_token.encode("utf-8")
-            next_token_id +=1
+            next_token_id += 1
 
         # Aggregate identical pretokens to reduce work
         pretoken_freqs = Counter(pretokens)
@@ -169,19 +173,23 @@ class Trainer:
         # Get initial weighted byte pair counts and index
         pair_counts, pair_index = self._build_pair_index(pretokens_unique, freqs)
 
+        # Build max-heap for O(log n) pair selection instead of O(n) scan
+        heap = self._build_heap(pair_counts, vocab)
+
         merges: List[Tuple[bytes, bytes]] = list()
 
         for _ in tqdm(range(self.num_merges), desc="Merging"):
-            
+
             if not pair_counts:
                 break
 
-            max_pair = self._get_pair_with_max_count(pair_counts, vocab)
-            
+            max_pair = self._heap_pop_valid(heap, pair_counts, vocab)
+            if max_pair is None:
+                break
+
             left_token, right_token = max_pair
 
             affected = list(pair_index.get(max_pair, ()))
-            # No more occurrences; remove and continue
             if not affected:
                 pair_counts.pop(max_pair, None)
                 pair_index.pop(max_pair, None)
@@ -197,9 +205,9 @@ class Trainer:
                 old_pretoken = pretokens_unique[pretoken_idx]
                 old_pairs = self._pairs_in(old_pretoken)
 
-                new_pretoken, changed = self._merge_all_occurrences(old_pretoken, 
-                                                                    left_token, 
-                                                                    right_token, 
+                new_pretoken, changed = self._merge_all_occurrences(old_pretoken,
+                                                                    left_token,
+                                                                    right_token,
                                                                     next_token_id)
                 if not changed:
                     continue
@@ -207,16 +215,21 @@ class Trainer:
                 pretokens_unique[pretoken_idx] = new_pretoken
                 new_pairs = self._pairs_in(new_pretoken)
 
-                pair_counts, pair_index = self._update_counts_and_index(old_pairs, 
+                pair_counts, pair_index = self._update_counts_and_index(old_pairs,
                                                                         new_pairs,
                                                                         pretoken_idx,
                                                                         freqs[pretoken_idx],
                                                                         pair_counts,
                                                                         pair_index)
+                # Push new/updated pairs onto the heap
+                for pair in set(new_pairs):
+                    c = pair_counts.get(pair, 0)
+                    if c > 0:
+                        tb = (vocab.get(pair[0], b""), vocab.get(pair[1], b""))
+                        heapq.heappush(heap, (-c, tb, pair))
 
-            # The merged pair should be fully consumed in processed pretokens
             pair_counts.pop(max_pair, None)
-            pair_index.pop(max_pair, None)            
+            pair_index.pop(max_pair, None)
 
             next_token_id += 1
 
