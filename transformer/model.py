@@ -102,12 +102,12 @@ class RMSNorm(nn.Module):
         return x
     
 class SiLU(nn.Module):
-    """Implement the SiLU activation function from scratch"""
+    """SiLU activation — delegates to F.silu for fused CUDA kernel"""
     def __init__(self):
         super().__init__()
 
     def forward(self, x: Float[Tensor, "..."]) -> Float[Tensor, "..."]:
-        return x * torch.sigmoid(x)
+        return F.silu(x)
 
 
 class SwiGLU(nn.Module):
@@ -233,8 +233,11 @@ class MultiHeadSelfAttention(nn.Module):
                     q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True
                 ) # [b, h, s, d]
         else:
-            mask = torch.ones(s, s, dtype=torch.bool, device=x.device).tril()
-            attn_out = scaled_dot_product_attention(q, k, v, mask) # [b, h, s, d]
+            # Use cached causal mask to avoid re-creating every forward pass
+            if not hasattr(self, '_causal_mask') or self._causal_mask.size(0) < s:
+                mask = torch.ones(s, s, dtype=torch.bool, device=x.device).tril()
+                self._causal_mask = mask
+            attn_out = scaled_dot_product_attention(q, k, v, self._causal_mask[:s, :s].to(x.device)) # [b, h, s, d]
 
         out = attn_out.transpose(1, 2).reshape(b, s, self.d_model)
         return self.o_proj(out)
