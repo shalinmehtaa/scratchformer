@@ -27,7 +27,7 @@ def _top_k_top_p_filtering(logits: torch.Tensor, top_k: int = 0, top_p: float = 
         kth_vals = topk_vals[..., -1, None]
         logits = logits.masked_fill(logits < kth_vals, float("-inf"))
 
-    if top_p is not None and top_p < 1.0:
+    if top_p is not None and 0.0 < top_p < 1.0:
         sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
         sorted_probs = torch.softmax(sorted_logits, dim=-1)
         cumprobs = sorted_probs.cumsum(dim=-1)
@@ -74,13 +74,19 @@ def generate(
 
     tokens_full = torch.tensor(prompt_ids, dtype=torch.long, device=device).unsqueeze(0)
     tokens_full = tokens_full.repeat(num_samples, 1)  # [B, S]
+    # Collect generated tokens in a list to avoid quadratic torch.cat
+    generated: List[torch.Tensor] = []
 
     finished = torch.zeros(num_samples, dtype=torch.bool, device=device)
 
     with torch.inference_mode():
         for _ in range(max_new_tokens):
             # Window the context to the model's max
-            input_tokens = tokens_full[:, -context_len:]
+            if generated:
+                all_tokens = torch.cat([tokens_full] + generated, dim=1)
+            else:
+                all_tokens = tokens_full
+            input_tokens = all_tokens[:, -context_len:]
 
             logits = model(input_tokens)  # [B, S, V]
             next_logits = logits[:, -1, :]  # [B, V]
@@ -93,10 +99,14 @@ def generate(
             if eos_id is not None:
                 finished |= (next_token.squeeze(1) == eos_id)
 
-            tokens_full = torch.cat([tokens_full, next_token], dim=1)
+            generated.append(next_token)
 
             if finished.all():
                 break
+
+    # Concatenate all generated tokens at once
+    if generated:
+        tokens_full = torch.cat([tokens_full] + generated, dim=1)
 
     # Decode per sample (trim at first EOS if present)
     outputs: List[str] = []

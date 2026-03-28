@@ -258,9 +258,10 @@ def main():
             xb, yb = get_batch(x_train, args.batch_size, args.context_length, device=str(device))
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32):
                 logits = model(xb)
-                loss = cross_entropy(logits, yb) / args.grad_accum_steps
-                total_loss += loss.item()
-                loss.backward()
+                loss = cross_entropy(logits, yb)
+                # Accumulate unscaled loss for logging, scale only for backward
+                total_loss += loss.item() / args.grad_accum_steps
+                (loss / args.grad_accum_steps).backward()
 
         # Gradient clipping
         if args.fsdp:

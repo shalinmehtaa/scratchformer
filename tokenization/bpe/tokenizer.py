@@ -1,12 +1,13 @@
 import json
+import heapq
 import base64
 import argparse
 from pathlib import Path
 from typing import (
-    Dict, 
-    List, 
-    Tuple, 
-    Optional, 
+    Dict,
+    List,
+    Tuple,
+    Optional,
     Self,
     Iterable,
     Iterator
@@ -88,39 +89,65 @@ class Tokenizer:
         if st_id is not None:
             yield st_id
             return
-        
+
         tokens: List[bytes] = [bytes([b]) for b in pretoken]
 
-        # Greedy BPE: repeatedly merge the lowest-rank adjacent pair
+        # Greedy BPE using a min-heap for O(n log n) merging instead of O(n²)
         if len(tokens) >= 2:
-            while True:
-                best_pair: Optional[Tuple[bytes, bytes]] = None
-                best_rank: Optional[int] = None
-                # Find best-ranked adjacent pair present
-                for i in range(len(tokens) - 1):
-                    pair = (tokens[i], tokens[i + 1])
-                    rank = self._merge_ranks.get(pair)
-                    if rank is not None and (best_rank is None or rank < best_rank):
-                        best_rank = rank
-                        best_pair = pair
-                if best_pair is None:
-                    break
+            # Build doubly-linked list via prev/next arrays for O(1) removal
+            n = len(tokens)
+            prev_idx = list(range(-1, n - 1))  # prev_idx[i] = i-1
+            next_idx = list(range(1, n + 1))   # next_idx[i] = i+1, n = sentinel
+            alive = [True] * n
 
-                # Merge all occurrences of best_pair, left-to-right
-                i = 0
-                out: List[bytes] = []
-                while i < len(tokens):
-                    if (
-                        i + 1 < len(tokens)
-                        and tokens[i] == best_pair[0]
-                        and tokens[i + 1] == best_pair[1]
-                    ):
-                        out.append(tokens[i] + tokens[i + 1])
-                        i += 2
-                    else:
-                        out.append(tokens[i])
-                        i += 1
-                tokens = out
+            # Heap entries: (rank, unique_tie_breaker, left_index)
+            heap: List[Tuple[int, int, int]] = []
+            for i in range(n - 1):
+                pair = (tokens[i], tokens[i + 1])
+                rank = self._merge_ranks.get(pair)
+                if rank is not None:
+                    heapq.heappush(heap, (rank, i, i))
+
+            while heap:
+                rank, _tie, left = heapq.heappop(heap)
+                # Skip stale entries: left must be alive and its right neighbor must match
+                if not alive[left]:
+                    continue
+                right = next_idx[left]
+                if right >= n or not alive[right]:
+                    continue
+                # Verify the pair still matches this rank
+                pair = (tokens[left], tokens[right])
+                actual_rank = self._merge_ranks.get(pair)
+                if actual_rank != rank:
+                    continue
+
+                # Merge: replace left token with concatenation, remove right
+                tokens[left] = tokens[left] + tokens[right]
+                alive[right] = False
+
+                # Update linked list: skip over right
+                nxt = next_idx[right]
+                next_idx[left] = nxt
+                if nxt < n:
+                    prev_idx[nxt] = left
+
+                # Push new pairs into heap
+                # Left pair: prev(left), left
+                p = prev_idx[left]
+                if p >= 0 and alive[p]:
+                    new_pair = (tokens[p], tokens[left])
+                    r = self._merge_ranks.get(new_pair)
+                    if r is not None:
+                        heapq.heappush(heap, (r, p, p))
+                # Right pair: left, next(left)
+                if nxt < n and alive[nxt]:
+                    new_pair = (tokens[left], tokens[nxt])
+                    r = self._merge_ranks.get(new_pair)
+                    if r is not None:
+                        heapq.heappush(heap, (r, left, left))
+
+            tokens = [tokens[i] for i in range(n) if alive[i]]
 
         for tok in tokens:
             yield self._token_to_id[tok]
