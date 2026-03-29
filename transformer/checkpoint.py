@@ -55,6 +55,15 @@ def load_checkpoint(src: PathOrFile, model: Module, optimizer: Optimizer, device
     if any(k.startswith("_orig_mod.") for k in model_sd.keys()):
         model_sd = {k.replace("_orig_mod.", "", 1): v for k, v in model_sd.items()}
 
+    # Migrate old SwiGLU checkpoints: fuse separate up/gate into up_gate
+    keys_to_migrate = [k for k in model_sd if ".ffn.up.weights" in k]
+    for up_key in keys_to_migrate:
+        gate_key = up_key.replace(".ffn.up.weights", ".ffn.gate.weights")
+        fused_key = up_key.replace(".ffn.up.weights", ".ffn.up_gate.weights")
+        if gate_key in model_sd:
+            model_sd[fused_key] = torch.cat([model_sd.pop(up_key), model_sd.pop(gate_key)], dim=0)
+        # If gate_key is missing, leave up_key as-is (shouldn't happen)
+
     if _is_fsdp_model(model):
         with FSDP.state_dict_type(
             model, StateDictType.FULL_STATE_DICT,

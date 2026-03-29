@@ -115,25 +115,26 @@ class SiLU(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    """Implement a SwiGLU feedforward network from scratch"""
-    def __init__(self, 
+    """Implement a SwiGLU feedforward network from scratch.
+
+    The up and gate projections are fused into a single Linear(d_model, 2*d_ff)
+    so they execute as one matmul, saving a kernel launch and memory round-trip.
+    """
+    def __init__(self,
                  d_model: int,
                  d_ff: int,
                  device: Optional[Union[str, torch.device]] = None,
                  dtype: Optional[torch.dtype] = None):
         super().__init__()
-        self.up = Linear(d_model, d_ff, device=device, dtype=dtype)
-        self.gate = Linear(d_model, d_ff, device=device, dtype=dtype)
+        self.d_ff = d_ff
+        self.up_gate = Linear(d_model, 2 * d_ff, device=device, dtype=dtype)
         self.down = Linear(d_ff, d_model, device=device, dtype=dtype)
-        self.silu = SiLU()
 
     def forward(self, x: Float[Tensor, "... d_model"]) -> Float[Tensor, "... d_model"]:
-        up_projection = self.up(x)
-        silu_activations = self.silu(up_projection)
-        gated_projection = self.gate(x)
-        swiglu_activations = silu_activations * gated_projection
-        down_projection = self.down(swiglu_activations)
-        return down_projection
+        up_and_gate = self.up_gate(x)  # [..., 2*d_ff]
+        up_projection, gated_projection = up_and_gate.split(self.d_ff, dim=-1)
+        swiglu_activations = F.silu(up_projection) * gated_projection
+        return self.down(swiglu_activations)
     
 
 class RotaryPositionalEmbedding(nn.Module):
