@@ -35,10 +35,16 @@ def get_batch(x: NDArray,
     inputs_np  = x[idx_in]
     targets_np = x[idx_tg]
 
-    # Convert to torch.long on the provided device
-    inputs  = torch.as_tensor(inputs_np, dtype=torch.long, device=device)
-    targets = torch.as_tensor(targets_np, dtype=torch.long, device=device)
-    
+    # Convert to torch.long; use non-blocking transfer to overlap with compute on CUDA
+    inputs  = torch.from_numpy(inputs_np.astype(np.int64))
+    targets = torch.from_numpy(targets_np.astype(np.int64))
+    if device and "cuda" in str(device):
+        inputs  = inputs.pin_memory().to(device, non_blocking=True)
+        targets = targets.pin_memory().to(device, non_blocking=True)
+    else:
+        inputs  = inputs.to(device)
+        targets = targets.to(device)
+
     return inputs, targets
 
 

@@ -78,13 +78,13 @@ def generate(
     finished = torch.zeros(num_samples, dtype=torch.bool, device=device)
 
     with torch.inference_mode():
+        # Prefill: process the full prompt to populate KV caches
+        input_tokens = tokens_full[:, -context_len:]
+        logits, kv_caches = model(input_tokens)
+        next_logits = logits[:, -1, :]  # [B, V]
+        cur_pos = input_tokens.shape[1]  # track absolute position for RoPE
+
         for _ in range(max_new_tokens):
-            # Window the context to the model's max
-            input_tokens = tokens_full[:, -context_len:]
-
-            logits = model(input_tokens)  # [B, S, V]
-            next_logits = logits[:, -1, :]  # [B, V]
-
             # Apply top-k/top-p on raw logits, then temperature in softmax
             filtered_logits = _top_k_top_p_filtering(next_logits, top_k=top_k, top_p=top_p)
             probs = softmax(filtered_logits, dim=-1, temperature=temperature)  # [B, V]
@@ -97,6 +97,20 @@ def generate(
 
             if finished.all():
                 break
+
+            # Decode step: only process the new token using KV cache
+            # If we've exceeded context_len, drop the oldest cache entries
+            if cur_pos >= context_len:
+                # Trim KV caches to context_len - 1 to make room
+                kv_caches = [
+                    (k[:, :, -(context_len - 1):, :], v[:, :, -(context_len - 1):, :])
+                    for k, v in kv_caches
+                ]
+                cur_pos = context_len - 1
+
+            logits, kv_caches = model(next_token, kv_caches=kv_caches)
+            next_logits = logits[:, -1, :]  # [B, V]
+            cur_pos += 1
 
     # Decode per sample (trim at first EOS if present)
     outputs: List[str] = []

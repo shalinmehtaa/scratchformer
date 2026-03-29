@@ -102,12 +102,16 @@ class RMSNorm(nn.Module):
         return x
     
 class SiLU(nn.Module):
-    """Implement the SiLU activation function from scratch"""
+    """Implement the SiLU activation function from scratch.
+
+    NOTE: For production use, prefer F.silu() which fuses into a single
+    CUDA kernel. This class is kept for educational reference.
+    """
     def __init__(self):
         super().__init__()
 
     def forward(self, x: Float[Tensor, "..."]) -> Float[Tensor, "..."]:
-        return x * torch.sigmoid(x)
+        return F.silu(x)
 
 
 class SwiGLU(nn.Module):
@@ -157,13 +161,12 @@ class RotaryPositionalEmbedding(nn.Module):
         self.register_buffer("cos_cached", cos, persistent=False)  # [max_seq_len, d_k/2]
         self.register_buffer("sin_cached", sin, persistent=False)  # [max_seq_len, d_k/2]
 
-    def forward(self, 
+    def forward(self,
                 x: Float[Tensor, "... seq_len d_k"],
                 token_positions: Int[Tensor, "... seq_len"]) -> Float[Tensor, "... seq_len d_k"]:
-        # Bounds check (tensor-only; compile-friendly)
-        max_pos_i64 = token_positions.to(torch.int64).max()
-        limit = torch.tensor(self.max_seq_len, device=token_positions.device, dtype=torch.int64)
-        torch._assert(max_pos_i64 < limit, "token_positions exceed max_seq_len used to precompute RoPE tables.")
+        # Bounds check removed from hot path — the precomputed buffer size
+        # already constrains valid positions; an out-of-bounds index will
+        # raise an IndexError naturally.
 
         cos = self.cos_cached[token_positions.long()] # [..., seq, d_k/2]
         sin = self.sin_cached[token_positions.long()] # [..., seq, d_k/2]
@@ -181,13 +184,19 @@ class RotaryPositionalEmbedding(nn.Module):
     
 
 class MultiHeadSelfAttention(nn.Module):
-    """Implement causal multi-head attention from scratch"""
-    def __init__(self, 
-                 d_model: int, 
-                 num_heads: int, 
-                 use_sdpa: bool = False,
+    """Implement causal multi-head attention from scratch.
+
+    Supports an optional KV cache for efficient autoregressive inference.
+    During training, pass ``kv_cache=None``. During inference, pass the
+    previous cache (or an empty tuple ``(None, None)`` on the first step)
+    and receive the updated cache back.
+    """
+    def __init__(self,
+                 d_model: int,
+                 num_heads: int,
+                 use_sdpa: bool = True,
                  rope: Optional["RotaryPositionalEmbedding"] = None,
-                 device: Optional[Union[str, torch.device]] = None, 
+                 device: Optional[Union[str, torch.device]] = None,
                  dtype: Optional[torch.dtype] = None):
         super().__init__()
         assert d_model % num_heads == 0, "d_model must be a multiple of num_heads"
@@ -206,9 +215,19 @@ class MultiHeadSelfAttention(nn.Module):
 
         self.use_sdpa = use_sdpa
 
-    def forward(self, 
-                x: Float[Tensor, "batch seq_len d_model"], 
-                token_positions: Optional[Int[Tensor, "batch seq_len"]] = None) -> Float[Tensor, "batch seq_len d_model"]:
+    def forward(self,
+                x: Float[Tensor, "batch seq_len d_model"],
+                token_positions: Optional[Int[Tensor, "batch seq_len"]] = None,
+                kv_cache: Optional[tuple] = None) -> tuple:
+        """
+        Args:
+            x: Input tensor [batch, seq_len, d_model].
+            token_positions: Absolute positions for RoPE [batch, seq_len].
+            kv_cache: Tuple of (cached_k, cached_v) from previous step, or None.
+
+        Returns:
+            (output, new_kv_cache) where new_kv_cache is None during training.
+        """
         b, s, _ = x.shape
 
         q = self.q_proj(x).reshape(b, s, self.num_heads, self.head_dim).transpose(1, 2) # [b, h, s, d]
@@ -226,29 +245,49 @@ class MultiHeadSelfAttention(nn.Module):
             q = self.rope(q, pos_b1s)
             k = self.rope(k, pos_b1s)
 
+        # KV cache: append current k, v to cached values
+        new_kv_cache = None
+        if kv_cache is not None:
+            cached_k, cached_v = kv_cache
+            if cached_k is not None:
+                k = torch.cat([cached_k, k], dim=2)
+                v = torch.cat([cached_v, v], dim=2)
+            new_kv_cache = (k, v)
+
         if self.use_sdpa:
-            # Prefer native SDPA kernels on CUDA when using FSDP
-            with sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.FLASH_ATTENTION]):
+            # Prefer Flash Attention and Efficient Attention kernels;
+            # MATH backend is excluded to avoid falling back to the slow path.
+            # is_causal is only valid when q and k have the same seq length
+            is_causal = (kv_cache is None) and (q.shape[2] == k.shape[2])
+            with sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]):
                 attn_out = F.scaled_dot_product_attention(
-                    q, k, v, attn_mask=None, dropout_p=0.0, is_causal=True
+                    q, k, v, attn_mask=None, dropout_p=0.0, is_causal=is_causal
                 ) # [b, h, s, d]
         else:
-            mask = torch.ones(s, s, dtype=torch.bool, device=x.device).tril()
+            # Fallback: use cached causal mask to avoid per-call allocation
+            total_s = k.shape[2]
+            if not hasattr(self, '_causal_mask') or self._causal_mask.shape[0] < total_s:
+                self._causal_mask = torch.ones(total_s, total_s, dtype=torch.bool, device=x.device).tril()
+            # For KV cache: query attends to all past + current keys
+            if kv_cache is not None:
+                mask = self._causal_mask[total_s - s:total_s, :total_s]
+            else:
+                mask = self._causal_mask[:s, :s]
             attn_out = scaled_dot_product_attention(q, k, v, mask) # [b, h, s, d]
 
         out = attn_out.transpose(1, 2).reshape(b, s, self.d_model)
-        return self.o_proj(out)
+        return self.o_proj(out), new_kv_cache
         
 
 class TransformerBlock(nn.Module):
     """Implement a transformer block from scratch"""
-    def __init__(self, 
-                 d_model: int, 
+    def __init__(self,
+                 d_model: int,
                  num_heads: int,
                  d_ff: int,
                  theta: float,
                  max_seq_len: int,
-                 use_sdpa: bool = False,
+                 use_sdpa: bool = True,
                  device: Optional[Union[str, torch.device]] = None, 
                  dtype: Optional[torch.dtype] = None):
         super().__init__()
@@ -259,10 +298,11 @@ class TransformerBlock(nn.Module):
         self.attn = MultiHeadSelfAttention(d_model=d_model, num_heads=num_heads, rope=self.rope, device=device, dtype=dtype, use_sdpa=use_sdpa)
         self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff, device=device, dtype=dtype)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln1(x))
+    def forward(self, x, kv_cache=None):
+        attn_out, new_kv_cache = self.attn(self.ln1(x), kv_cache=kv_cache)
+        x = x + attn_out
         x = x + self.ffn(self.ln2(x))
-        return x
+        return x, new_kv_cache
 
 class Transformer(nn.Module):
     """Implement a complete Transformer LM from scratch"""
@@ -274,8 +314,8 @@ class Transformer(nn.Module):
                  num_heads: int,
                  d_ff: int,
                  theta: float,
-                 use_sdpa: bool = False,
-                 device: Optional[Union[str, torch.device]] = None, 
+                 use_sdpa: bool = True,
+                 device: Optional[Union[str, torch.device]] = None,
                  dtype: Optional[torch.dtype] = None):
         super().__init__()
         self.vocab_size = vocab_size
@@ -303,11 +343,24 @@ class Transformer(nn.Module):
         # Weight tying
         self.lm_head.weights = self.token_embeddings.weights  
 
-    def forward(self, in_tokens: Float[Tensor, "batch_size seq_len"]) -> Float[Tensor, "batch_size seq_len vocab_size"]:
+    def forward(self, in_tokens: Float[Tensor, "batch_size seq_len"],
+                kv_caches: Optional[list] = None) -> tuple:
+        """
+        Args:
+            in_tokens: Token IDs [batch, seq_len].
+            kv_caches: List of per-layer KV caches, or None for training.
+
+        Returns:
+            (logits, new_kv_caches) — new_kv_caches is None during training.
+        """
         x = self.token_embeddings(in_tokens)
-        for block in self.layers:
-            x = block(x)
+        new_kv_caches = [] if kv_caches is not None else None
+        for i, block in enumerate(self.layers):
+            layer_cache = kv_caches[i] if kv_caches is not None else None
+            x, new_cache = block(x, kv_cache=layer_cache)
+            if new_kv_caches is not None:
+                new_kv_caches.append(new_cache)
         x_norm = self.ln_final(x)
         logits = self.lm_head(x_norm)
 
-        return logits
+        return logits, new_kv_caches

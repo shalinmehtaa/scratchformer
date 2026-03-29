@@ -112,7 +112,7 @@ def evaluate(model: Transformer,
         xb, yb = get_batch(x_valid, batch_size, context_length, device)
         # Match training numerics: forward under autocast
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16 if device_type == "cuda" else torch.float32):
-            logits = model(xb)
+            logits, _ = model(xb)
             loss = cross_entropy(logits, yb)
             total += loss.detach()
             count += 1
@@ -165,7 +165,7 @@ def main():
 
     device = torch.device(args.device)        
 
-    # Build model
+    # Build model — always use SDPA for efficient attention kernels
     model = Transformer(
         vocab_size=args.vocab_size,
         context_length=args.context_length,
@@ -176,12 +176,11 @@ def main():
         theta=args.theta,
         device=device,
         dtype=None,
-        use_sdpa=args.fsdp,
-    ) 
+        use_sdpa=True,
+    )
 
-    if args.compile:
-        # torch.compile + FSDP is fragile; skip compile when using fsdp
-        assert not args.fsdp, "Disable --compile when using --fsdp"
+    if args.compile and args.fsdp:
+        print("Warning: torch.compile + FSDP can be fragile. Proceeding anyway (PyTorch 2.6+).")
 
     if args.fsdp:
         auto_wrap = functools.partial(
@@ -217,12 +216,31 @@ def main():
             ) 
     else:
         model.to(device)
-        optimizer = AdamW(
-            model.parameters(),
-            lr=args.lr,
-            betas=tuple(args.betas),
-            weight_decay=args.weight_decay
-        )
+        # Use native fused AdamW on CUDA for better performance;
+        # fall back to custom AdamW on CPU.
+        if device.type == "cuda":
+            try:
+                optimizer = torch.optim.AdamW(
+                    model.parameters(),
+                    lr=args.lr,
+                    betas=tuple(args.betas),
+                    weight_decay=args.weight_decay,
+                    fused=True,
+                )
+            except TypeError:
+                optimizer = torch.optim.AdamW(
+                    model.parameters(),
+                    lr=args.lr,
+                    betas=tuple(args.betas),
+                    weight_decay=args.weight_decay,
+                )
+        else:
+            optimizer = AdamW(
+                model.parameters(),
+                lr=args.lr,
+                betas=tuple(args.betas),
+                weight_decay=args.weight_decay
+            )
 
     start_step = 0
     if args.resume is not None and os.path.exists(args.resume):
@@ -257,16 +275,16 @@ def main():
         for _ in range(args.grad_accum_steps):
             xb, yb = get_batch(x_train, args.batch_size, args.context_length, device=str(device))
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16 if device.type == "cuda" else torch.float32):
-                logits = model(xb)
+                logits, _ = model(xb)
                 loss = cross_entropy(logits, yb) / args.grad_accum_steps
                 total_loss += loss.item()
                 loss.backward()
 
-        # Gradient clipping
+        # Gradient clipping — use native util for non-FSDP (avoids Python loop)
         if args.fsdp:
             grad_norm = FSDP.clip_grad_norm_(model, args.clip_grad)
         else:
-            grad_norm = gradient_clipping(list(model.parameters()), args.clip_grad)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
 
         optimizer.step()
 
