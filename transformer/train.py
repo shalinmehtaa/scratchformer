@@ -75,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad_accum_steps", type=int, default=1)
     p.add_argument("--weights_only", action="store_true", help="Save model weights only (no optimizer).")
     p.add_argument("--sharded_checkpoint", action="store_true", help="Save/load sharded checkpoints per-rank.")
+    p.add_argument("--gradient_checkpointing", action="store_true", help="Recompute activations per layer to save memory")
 
     return p.parse_args()
 
@@ -178,6 +179,11 @@ def main():
         dtype=None,
         use_sdpa=True,
     )
+
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing = True
+        if is_main_process():
+            print("Gradient checkpointing enabled")
 
     if args.compile and args.fsdp:
         print("Warning: torch.compile + FSDP can be fragile. Proceeding anyway (PyTorch 2.6+).")

@@ -326,6 +326,7 @@ class Transformer(nn.Module):
         self.d_ff = d_ff
         self.theta = theta
         self.num_layers = num_layers
+        self.gradient_checkpointing = False
         self.token_embeddings = Embedding(self.vocab_size, self.d_model, device=device, dtype=dtype)
         self.layers = nn.ModuleList([
             TransformerBlock(
@@ -342,7 +343,7 @@ class Transformer(nn.Module):
         self.ln_final = RMSNorm(self.d_model)
         self.lm_head = Linear(self.d_model, self.vocab_size, device=device, dtype=dtype)
         # Weight tying
-        self.lm_head.weights = self.token_embeddings.weights  
+        self.lm_head.weights = self.token_embeddings.weights
 
     def forward(self, in_tokens: Float[Tensor, "batch_size seq_len"],
                 kv_caches: Optional[list] = None) -> tuple:
@@ -358,7 +359,12 @@ class Transformer(nn.Module):
         new_kv_caches = [] if kv_caches is not None else None
         for i, block in enumerate(self.layers):
             layer_cache = kv_caches[i] if kv_caches is not None else None
-            x, new_cache = block(x, kv_cache=layer_cache)
+            if self.gradient_checkpointing and self.training and layer_cache is None:
+                x, new_cache = torch.utils.checkpoint.checkpoint(
+                    block, x, layer_cache, use_reentrant=False
+                )
+            else:
+                x, new_cache = block(x, kv_cache=layer_cache)
             if new_kv_caches is not None:
                 new_kv_caches.append(new_cache)
         x_norm = self.ln_final(x)
